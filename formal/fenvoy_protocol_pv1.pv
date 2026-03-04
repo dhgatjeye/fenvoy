@@ -1,0 +1,300 @@
+(* fenvoy_protocol.pv — ProVerif model of the Fenvoy handshake        *)
+(*                                                                     *)
+(* Hybrid PQ handshake, Noise XX-inspired, 3-message mutual auth.     *)
+(*                                                                     *)
+(*   msg1  I->R :  epk_i, ek_i                                        *)
+(*   msg2  R->I :  epk_r, ct, AEAD_hs_r(id_r || sig_r(h1))           *)
+(*   msg3  I->R :  AEAD_hs_i(id_i || sig_i(h2))                      *)
+(*                                                                     *)
+(* KDF chain:                                                          *)
+(*   h1       = SHA256(PROTO_LABEL || msg1)                            *)
+(*   dh_ss    = X25519(eski, epkR)                                     *)
+(*   kem_ss   = ML-KEM.Decaps(dk, ct)                                 *)
+(*   master   = HKDF(dh_ss||kem_ss, h1, "fenvoy-hybrid-v1")          *)
+(*   hs_key_r = HKDF(master, h1, "fenvoy-hs-enc-r")                  *)
+(*   hs_key_i = HKDF(master, h1, "fenvoy-hs-enc-i")                  *)
+(*   h2       = SHA256(h1 || msg2)                                     *)
+(*   h3       = SHA256(h2 || msg3)                                     *)
+(*   tx/rx    = HKDF(master, h3, "fenvoy-session-{i,r}-{tx,rx}")     *)
+(*                                                                     *)
+(* Primitives: X25519, ML-KEM-1024, Ed25519, HKDF-SHA256,             *)
+(*             ChaCha20-Poly1305                                       *)
+(*                                                                     *)
+(* Queries:                                                            *)
+(*   Q1  session key secrecy + forward secrecy (phase model)           *)
+(*   Q2  mutual auth (non-injective correspondence)                    *)
+(*   Q3  injective agreement (replay protection)                       *)
+(*   Q4a initiator identity hiding  — holds                            *)
+(*   Q4b responder identity hiding  — false (XX pattern, by design)    *)
+(*                                                                     *)
+(* 2026-03-04                                                          *)
+
+
+(* ---------- channel ---------- *)
+
+free c: channel.
+
+
+(* ---------- types ---------- *)
+
+type skey.      (* Ed25519 sk  *)
+type pkey.      (* Ed25519 pk  *)
+type dhskey.    (* X25519  sk  *)
+type dhpkey.    (* X25519  pk  *)
+type kemskey.   (* ML-KEM  dk  *)
+type kempkey.   (* ML-KEM  ek  *)
+type kemct.     (* ML-KEM  ct  *)
+type symkey.
+
+
+(* ---------- X25519 (CDH) ---------- *)
+
+fun dh_pk(dhskey): dhpkey.
+fun dh_shared(dhskey, dhpkey): bitstring.
+
+equation forall a: dhskey, b: dhskey;
+    dh_shared(a, dh_pk(b)) = dh_shared(b, dh_pk(a)).
+
+
+(* ---------- ML-KEM-1024 ---------- *)
+(* IND-CCA KEM with explicit coins *)
+
+fun kem_pk(kemskey): kempkey.
+fun kem_enc_ct(kempkey, bitstring): kemct.
+fun kem_enc_ss(kempkey, bitstring): bitstring.
+
+reduc forall dk: kemskey, coins: bitstring;
+    kem_dec(dk, kem_enc_ct(kem_pk(dk), coins)) = kem_enc_ss(kem_pk(dk), coins).
+
+
+(* ---------- Ed25519 ---------- *)
+
+fun sign_pk(skey): pkey.
+fun ed_sign(skey, bitstring): bitstring.
+
+reduc forall sk: skey, m: bitstring;
+    ed_verify(sign_pk(sk), m, ed_sign(sk, m)) = true.
+
+
+(* ---------- hash ---------- *)
+
+fun H(bitstring): bitstring.
+
+
+(* ---------- HKDF (domain-separated stages) ---------- *)
+
+fun kdf_master(bitstring, bitstring, bitstring): symkey.
+fun kdf_hs_r(symkey, bitstring): symkey.
+fun kdf_hs_i(symkey, bitstring): symkey.
+fun kdf_itx(symkey, bitstring): symkey.
+fun kdf_irx(symkey, bitstring): symkey.
+
+
+(* ---------- AEAD (ChaCha20-Poly1305) ---------- *)
+
+fun senc(symkey, bitstring, bitstring): bitstring.
+
+reduc forall k: symkey, pt: bitstring, aad: bitstring;
+    sdec(k, senc(k, pt, aad), aad) = pt.
+
+
+(* ---------- AAD labels ---------- *)
+
+free aad_identity_r: bitstring.
+free aad_identity_i: bitstring.
+
+
+(* ---------- events ---------- *)
+
+event InitiatorBegin(pkey, pkey).
+event InitiatorEnd(pkey, pkey, symkey, symkey).
+event ResponderBegin(pkey).
+event ResponderEnd(pkey, pkey, symkey, symkey).
+
+
+(* ---------- Q1: session key secrecy / forward secrecy ---------- *)
+(* Phase 0 = honest run, phase 1 = long-term key reveal.          *)
+(* Secrecy across phases => forward secrecy.                       *)
+
+free witness_itx: bitstring [private].
+free witness_irx: bitstring [private].
+
+query attacker(witness_itx).
+query attacker(witness_irx).
+
+
+(* ---------- Q2: mutual authentication ---------- *)
+
+query pkI: pkey, pkR: pkey, kt: symkey, kr: symkey;
+    event(InitiatorEnd(pkI, pkR, kt, kr))
+    ==> event(ResponderBegin(pkR)).
+
+query pkI: pkey, pkR: pkey, kt: symkey, kr: symkey;
+    event(ResponderEnd(pkR, pkI, kt, kr))
+    ==> event(InitiatorBegin(pkI, pkR)).
+
+
+(* ---------- Q3: injective agreement ---------- *)
+
+query pkI: pkey, pkR: pkey, kt: symkey, kr: symkey;
+    inj-event(InitiatorEnd(pkI, pkR, kt, kr))
+    ==> inj-event(ResponderBegin(pkR)).
+
+query pkI: pkey, pkR: pkey, kt: symkey, kr: symkey;
+    inj-event(ResponderEnd(pkR, pkI, kt, kr))
+    ==> inj-event(InitiatorBegin(pkI, pkR)).
+
+
+(* ---------- Q4: identity hiding ---------- *)
+(* Q4a holds: I's identity is encrypted under an authenticated key.   *)
+(* Q4b false: R's identity leaks to active attacker — standard XX.    *)
+
+free id_witness_i: bitstring [private].
+free id_witness_r: bitstring [private].
+
+query attacker(id_witness_i).
+query attacker(id_witness_r).
+
+
+(* ================================================================ *)
+(*  Initiator                                                        *)
+(* ================================================================ *)
+
+let Initiator(skI: skey, pkR_expected: pkey) =
+    let pkI = sign_pk(skI) in
+
+    (* --- msg1 --- *)
+    new eski: dhskey;
+    let epkI = dh_pk(eski) in
+
+    new dkI: kemskey;
+    let ekI = kem_pk(dkI) in
+
+    out(c, (epkI, ekI));
+
+    let h1 = H((epkI, ekI)) in
+
+    (* --- recv msg2 --- *)
+    in(c, (epkR: dhpkey, kem_ct: kemct, enc_id_r: bitstring));
+
+    let x25519_ss  = dh_shared(eski, epkR) in
+    let kem_shared = kem_dec(dkI, kem_ct) in
+
+    let master   = kdf_master(x25519_ss, kem_shared, h1) in
+    let hs_key_r = kdf_hs_r(master, h1) in
+    let hs_key_i = kdf_hs_i(master, h1) in
+
+    let (rpk: pkey, rsig: bitstring) =
+        sdec(hs_key_r, enc_id_r, aad_identity_r) in
+
+    if ed_verify(rpk, h1, rsig) = true then
+    if rpk = pkR_expected then              (* peer-store check *)
+
+    event InitiatorBegin(pkI, rpk);
+
+    (* --- msg3 --- *)
+    let msg2 = (epkR, kem_ct, enc_id_r) in
+    let h2 = H((h1, msg2)) in
+
+    let isig = ed_sign(skI, h2) in
+    let enc_id_i = senc(hs_key_i, (pkI, isig), aad_identity_i) in
+
+    out(c, enc_id_i);
+
+    (* --- session keys --- *)
+    let h3 = H((h2, enc_id_i)) in
+
+    let tx_key = kdf_itx(master, h3) in
+    let rx_key = kdf_irx(master, h3) in
+
+    event InitiatorEnd(pkI, rpk, tx_key, rx_key);
+
+    out(c, senc(tx_key, witness_itx, h3));          (* Q1 witness *)
+    out(c, senc(tx_key, id_witness_i, (h3, pkI)));  (* Q4a witness *)
+
+    phase 1;
+    out(c, skI).
+
+
+(* ================================================================ *)
+(*  Responder                                                        *)
+(* ================================================================ *)
+
+let Responder(skR: skey, pkI_expected: pkey) =
+    let pkR = sign_pk(skR) in
+
+    event ResponderBegin(pkR);
+
+    (* --- recv msg1 --- *)
+    in(c, (epkI: dhpkey, ekI: kempkey));
+
+    let h1 = H((epkI, ekI)) in
+
+    new eskr: dhskey;
+    let epkR = dh_pk(eskr) in
+
+    let x25519_ss  = dh_shared(eskr, epkI) in
+
+    new coins: bitstring;
+    let kem_ct     = kem_enc_ct(ekI, coins) in
+    let kem_shared = kem_enc_ss(ekI, coins) in
+
+    let master   = kdf_master(x25519_ss, kem_shared, h1) in
+    let hs_key_r = kdf_hs_r(master, h1) in
+    let hs_key_i = kdf_hs_i(master, h1) in
+
+    (* --- msg2 --- *)
+    let rsig = ed_sign(skR, h1) in
+    let enc_id_r = senc(hs_key_r, (pkR, rsig), aad_identity_r) in
+
+    out(c, (epkR, kem_ct, enc_id_r));
+
+    (* Q4b witness — sent before I is authenticated, hence leaks in XX *)
+    out(c, senc(hs_key_r, id_witness_r, (h1, pkR)));
+
+    (* --- recv msg3 --- *)
+    let msg2 = (epkR, kem_ct, enc_id_r) in
+    let h2 = H((h1, msg2)) in
+
+    in(c, enc_id_i: bitstring);
+
+    let (ipk: pkey, isig: bitstring) =
+        sdec(hs_key_i, enc_id_i, aad_identity_i) in
+
+    if ed_verify(ipk, h2, isig) = true then
+    if ipk = pkI_expected then              (* peer-store check *)
+
+    (* --- session keys --- *)
+    let h3 = H((h2, enc_id_i)) in
+
+    let rx_key = kdf_itx(master, h3) in    (* R_rx = I_tx *)
+    let tx_key = kdf_irx(master, h3) in    (* R_tx = I_rx *)
+
+    event ResponderEnd(pkR, ipk, tx_key, rx_key);
+
+    out(c, senc(tx_key, witness_irx, h3));  (* Q1 witness *)
+
+    phase 1;
+    out(c, skR).
+
+
+(* ================================================================ *)
+(*  Top-level                                                        *)
+(* ================================================================ *)
+
+process
+    new skA: skey;
+    new skB: skey;
+    let pkA = sign_pk(skA) in
+    let pkB = sign_pk(skB) in
+
+    out(c, pkA);
+    out(c, pkB);
+
+    (* unbounded sessions, all honest role combinations *)
+    (
+        (!Initiator(skA, pkB)) |
+        (!Responder(skB, pkA)) |
+        (!Initiator(skB, pkA)) |
+        (!Responder(skA, pkB))
+    )
