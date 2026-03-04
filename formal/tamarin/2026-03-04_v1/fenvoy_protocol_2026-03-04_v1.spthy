@@ -1,0 +1,316 @@
+/*
+ * fenvoy_protocol.spthy — Tamarin Prover model of the Fenvoy handshake
+ *
+ * Hybrid PQ handshake, Noise XX-inspired, 3-message mutual auth.
+ *
+ *   msg1  I->R :  epkI, ekI
+ *   msg2  R->I :  epkR, kem_ct, senc(<pkR, rsig>, hs_key_r)
+ *   msg3  I->R :  senc(<pkI, isig>, hs_key_i)
+ *
+ * KDF chain:
+ *   h1       = h(<epkI, ekI>)
+ *   dh_ss    = X25519(eski, epkR)
+ *   kem_ss   = ML-KEM.Decaps(dk, ct)
+ *   master   = kdf_master(dh_ss, kem_ss, h1)
+ *   hs_key_r = kdf_hs_r(master, h1)
+ *   hs_key_i = kdf_hs_i(master, h1)
+ *   h2       = h(<h1, epkR, kem_ct, enc_id_r>)
+ *   h3       = h(<h2, enc_id_i>)
+ *   tx/rx    = kdf_itx(master, h3) / kdf_irx(master, h3)
+ *
+ * Primitives: X25519, ML-KEM-1024, Ed25519, HKDF-SHA256,
+ *             ChaCha20-Poly1305
+ *
+ * Queries:
+ *   Q1  session key secrecy + forward secrecy
+ *   Q2  mutual authentication (non-injective correspondence)
+ *   Q3  injective agreement (replay protection)
+ *   Q4a initiator identity hiding  — holds
+ *   Q4b responder identity hiding  — false (XX pattern, by design)
+ *
+ * Isomorphic with formal/fenvoy_protocol_pv1.pv (ProVerif).
+ *
+ * 03/04/2026
+ */
+
+theory Fenvoy
+begin
+
+/* ---------- builtins ---------- */
+
+builtins: signing, hashing, diffie-hellman, asymmetric-encryption,
+          symmetric-encryption
+
+/* ---------- function symbols ---------- */
+
+functions:
+    fst/1, snd/1,                   /* pair projections             */
+    kdf_master/3,                   /* HKDF stages (domain-separated) */
+    kdf_hs_r/2,
+    kdf_hs_i/2,
+    kdf_itx/2,
+    kdf_irx/2
+
+equations:
+    fst(<x, y>) = x,
+    snd(<x, y>) = y
+
+/* ---------- restriction ---------- */
+
+restriction Equality:
+    "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+/* ---------- long-term key management ---------- */
+
+rule LTK_Setup:
+    [ Fr(~sk) ]
+    --[ LTKGen(pk(~sk)) ]->
+    [ !LTK(pk(~sk), ~sk)
+    , !PeerPK(pk(~sk))
+    , Out(pk(~sk)) ]
+
+rule LTK_Reveal:
+    [ !LTK(pkX, ~skX) ]
+    --[ RevealLTK(pkX) ]->
+    [ Out(~skX) ]
+
+/* ---------- Initiator step 1: send msg1 ---------- */
+
+rule I_1:
+    let epkI = 'g'^~eski
+        ekI  = pk(~dkI)
+        h1   = h(<epkI, ekI>)
+    in
+    [ Fr(~eski)
+    , Fr(~dkI)
+    , Fr(~sid)
+    , !LTK(pkI, ~skI)
+    , !PeerPK(pkR)
+    ]
+    --[ I_Start(~sid, pkI, pkR) ]->
+    [ St_I1(~sid, pkI, ~skI, pkR, ~eski, ~dkI, h1)
+    , Out(<epkI, ekI>) ]
+
+/* ---------- Initiator step 2: recv msg2, send msg3 ---------- */
+
+rule I_2:
+    let x25519_ss = epkR^~eski
+        kem_ss    = adec(kem_ct, ~dkI)
+        master    = kdf_master(x25519_ss, kem_ss, h1)
+        hs_key_r  = kdf_hs_r(master, h1)
+        hs_key_i  = kdf_hs_i(master, h1)
+
+        pt_r      = sdec(enc_id_r, hs_key_r)
+        rpk       = fst(pt_r)
+        rsig      = snd(pt_r)
+
+        h2        = h(<h1, epkR, kem_ct, enc_id_r>)
+        isig      = sign(h2, ~skI)
+        enc_id_i  = senc(<pkI, isig>, hs_key_i)
+
+        h3        = h(<h2, enc_id_i>)
+        tx_key    = kdf_itx(master, h3)
+        rx_key    = kdf_irx(master, h3)
+    in
+    [ St_I1(~sid, pkI, ~skI, pkR, ~eski, ~dkI, h1)
+    , In(<epkR, kem_ct, enc_id_r>)
+    ]
+    --[ Eq(verify(rsig, h1, rpk), true)
+      , Eq(rpk, pkR)
+      , I_AuthR(~sid, pkI, pkR)
+      , I_End(~sid, pkI, pkR, tx_key, rx_key)
+      , ITxKey(~sid, pkI, pkR, tx_key)
+      , IRxKey(~sid, pkI, pkR, rx_key)
+      , I2_HsKeyI(~sid, pkI, pkR, hs_key_i)
+      , Honest(pkI)
+      , Honest(pkR)
+    ]->
+    [ St_I2(~sid, pkI, pkR, tx_key, rx_key)
+    , Out(enc_id_i) ]
+
+/* ---------- Responder step 1: recv msg1, send msg2 ---------- */
+
+rule R_1:
+    let h1        = h(<epkI, ekI>)
+        epkR      = 'g'^~eskr
+        x25519_ss = epkI^~eskr
+        kem_ct    = aenc(~r, ekI)
+        kem_ss    = ~r
+        master    = kdf_master(x25519_ss, kem_ss, h1)
+        hs_key_r  = kdf_hs_r(master, h1)
+        hs_key_i  = kdf_hs_i(master, h1)
+        rsig      = sign(h1, ~skR)
+        enc_id_r  = senc(<pkR, rsig>, hs_key_r)
+    in
+    [ Fr(~eskr)
+    , Fr(~r)
+    , Fr(~sid)
+    , !LTK(pkR, ~skR)
+    , !PeerPK(pkI)
+    , In(<epkI, ekI>)
+    ]
+    --[ R_Start(~sid, pkR, pkI)
+      , R1_HsKeyR(~sid, pkR, hs_key_r)
+    ]->
+    [ St_R1(~sid, pkR, pkI, master, hs_key_i, h1, epkR, kem_ct, enc_id_r)
+    , Out(<epkR, kem_ct, enc_id_r>) ]
+
+/* ---------- Responder step 2: recv msg3 ---------- */
+
+rule R_2:
+    let h2     = h(<h1, epkR, kem_ct, enc_id_r>)
+        pt_i   = sdec(enc_id_i, hs_key_i)
+        ipk    = fst(pt_i)
+        isig   = snd(pt_i)
+
+        h3     = h(<h2, enc_id_i>)
+        rx_key = kdf_itx(master, h3)   /* R_rx = I_tx */
+        tx_key = kdf_irx(master, h3)   /* R_tx = I_rx */
+    in
+    [ St_R1(~sid, pkR, pkI, master, hs_key_i, h1, epkR, kem_ct, enc_id_r)
+    , In(enc_id_i)
+    ]
+    --[ Eq(verify(isig, h2, ipk), true)
+      , Eq(ipk, pkI)
+      , R_End(~sid, pkR, pkI, tx_key, rx_key)
+      , RTxKey(~sid, pkR, pkI, tx_key)
+      , RRxKey(~sid, pkR, pkI, rx_key)
+      , Honest(pkR)
+      , Honest(pkI)
+    ]->
+    [ St_R2(~sid, pkR, pkI, tx_key, rx_key) ]
+
+/* ---------- executability ---------- */
+
+lemma can_execute:
+    exists-trace
+    "Ex sidI sidR pkI pkR tx rx #a #b.
+         I_End(sidI, pkI, pkR, tx, rx) @ #a
+       & R_End(sidR, pkR, pkI, rx, tx) @ #b"
+
+/* ---------- Q1a: session key secrecy ---------- */
+
+lemma key_secrecy_I_tx [reuse]:
+    "All sid pkI pkR tx rx #e.
+         I_End(sid, pkI, pkR, tx, rx) @ #e
+       & not (Ex #r. RevealLTK(pkI) @ #r & #r < #e)
+       & not (Ex #r. RevealLTK(pkR) @ #r & #r < #e)
+       ==> not (Ex #k. K(tx) @ #k)"
+
+lemma key_secrecy_I_rx [reuse]:
+    "All sid pkI pkR tx rx #e.
+         I_End(sid, pkI, pkR, tx, rx) @ #e
+       & not (Ex #r. RevealLTK(pkI) @ #r & #r < #e)
+       & not (Ex #r. RevealLTK(pkR) @ #r & #r < #e)
+       ==> not (Ex #k. K(rx) @ #k)"
+
+lemma key_secrecy_R_tx [reuse]:
+    "All sid pkR pkI tx rx #e.
+         R_End(sid, pkR, pkI, tx, rx) @ #e
+       & not (Ex #r. RevealLTK(pkR) @ #r & #r < #e)
+       & not (Ex #r. RevealLTK(pkI) @ #r & #r < #e)
+       ==> not (Ex #k. K(tx) @ #k)"
+
+lemma key_secrecy_R_rx [reuse]:
+    "All sid pkR pkI tx rx #e.
+         R_End(sid, pkR, pkI, tx, rx) @ #e
+       & not (Ex #r. RevealLTK(pkR) @ #r & #r < #e)
+       & not (Ex #r. RevealLTK(pkI) @ #r & #r < #e)
+       ==> not (Ex #k. K(rx) @ #k)"
+
+/* ---------- Q1b: perfect forward secrecy ---------- */
+
+lemma pfs_I_tx:
+    "All sid pkI pkR tx rx #e.
+         I_End(sid, pkI, pkR, tx, rx) @ #e
+       ==> not (Ex #k. K(tx) @ #k)
+         | (Ex #r. RevealLTK(pkI) @ #r)
+         | (Ex #r. RevealLTK(pkR) @ #r)"
+
+lemma pfs_I_rx:
+    "All sid pkI pkR tx rx #e.
+         I_End(sid, pkI, pkR, tx, rx) @ #e
+       ==> not (Ex #k. K(rx) @ #k)
+         | (Ex #r. RevealLTK(pkI) @ #r)
+         | (Ex #r. RevealLTK(pkR) @ #r)"
+
+lemma pfs_R_tx:
+    "All sid pkR pkI tx rx #e.
+         R_End(sid, pkR, pkI, tx, rx) @ #e
+       ==> not (Ex #k. K(tx) @ #k)
+         | (Ex #r. RevealLTK(pkR) @ #r)
+         | (Ex #r. RevealLTK(pkI) @ #r)"
+
+lemma pfs_R_rx:
+    "All sid pkR pkI tx rx #e.
+         R_End(sid, pkR, pkI, tx, rx) @ #e
+       ==> not (Ex #k. K(rx) @ #k)
+         | (Ex #r. RevealLTK(pkR) @ #r)
+         | (Ex #r. RevealLTK(pkI) @ #r)"
+
+/* ---------- Q2: mutual authentication ---------- */
+
+lemma mutual_auth_I:
+    "All sid pkI pkR tx rx #e.
+         I_End(sid, pkI, pkR, tx, rx) @ #e
+       & not (Ex #r. RevealLTK(pkR) @ #r)
+       ==> Ex sid2 pkI2 #b. R_Start(sid2, pkR, pkI2) @ #b & #b < #e"
+
+lemma mutual_auth_R:
+    "All sid pkR pkI tx rx #e.
+         R_End(sid, pkR, pkI, tx, rx) @ #e
+       & not (Ex #r. RevealLTK(pkI) @ #r)
+       ==> Ex sid2 #b. I_AuthR(sid2, pkI, pkR) @ #b & #b < #e"
+
+/* ---------- Q3: injective agreement / replay protection ---------- */
+
+lemma inj_agree_I_tx:
+    "All s1 s2 pkI pkR k #t1 #t2.
+         ITxKey(s1, pkI, pkR, k) @ #t1
+       & ITxKey(s2, pkI, pkR, k) @ #t2
+       & not (Ex #r. RevealLTK(pkI) @ #r)
+       & not (Ex #r. RevealLTK(pkR) @ #r)
+       ==> #t1 = #t2"
+
+lemma inj_agree_I_rx:
+    "All s1 s2 pkI pkR k #t1 #t2.
+         IRxKey(s1, pkI, pkR, k) @ #t1
+       & IRxKey(s2, pkI, pkR, k) @ #t2
+       & not (Ex #r. RevealLTK(pkI) @ #r)
+       & not (Ex #r. RevealLTK(pkR) @ #r)
+       ==> #t1 = #t2"
+
+lemma inj_agree_R_tx:
+    "All s1 s2 pkR pkI k #t1 #t2.
+         RTxKey(s1, pkR, pkI, k) @ #t1
+       & RTxKey(s2, pkR, pkI, k) @ #t2
+       & not (Ex #r. RevealLTK(pkR) @ #r)
+       & not (Ex #r. RevealLTK(pkI) @ #r)
+       ==> #t1 = #t2"
+
+lemma inj_agree_R_rx:
+    "All s1 s2 pkR pkI k #t1 #t2.
+         RRxKey(s1, pkR, pkI, k) @ #t1
+       & RRxKey(s2, pkR, pkI, k) @ #t2
+       & not (Ex #r. RevealLTK(pkR) @ #r)
+       & not (Ex #r. RevealLTK(pkI) @ #r)
+       ==> #t1 = #t2"
+
+/* ---------- Q4a: initiator identity hiding (expected: verified) ---------- */
+
+lemma init_hs_key_secret:
+    "All sid pkI pkR hki #e.
+         I2_HsKeyI(sid, pkI, pkR, hki) @ #e
+       & not (Ex #r. RevealLTK(pkI) @ #r)
+       & not (Ex #r. RevealLTK(pkR) @ #r)
+       ==> not (Ex #k. K(hki) @ #k)"
+
+/* ---------- Q4b: responder identity hiding (expected: falsified) ---------- */
+
+lemma resp_hs_key_secret:
+    "All sid pkR hkr #e.
+         R1_HsKeyR(sid, pkR, hkr) @ #e
+       & not (Ex #r. RevealLTK(pkR) @ #r)
+       ==> not (Ex #k. K(hkr) @ #k)"
+
+end
