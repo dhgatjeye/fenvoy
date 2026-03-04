@@ -12,6 +12,16 @@ pub const TAG_LEN: usize = 16;
 pub const MAX_NONCE: u64 = u64::MAX;
 pub const REKEY_INTERVAL: u64 = 1 << 32;
 
+const _: () = assert!(
+    REKEY_INTERVAL.is_power_of_two(),
+    "REKEY_INTERVAL must be a power of two",
+);
+
+const _: () = assert!(
+    size_of::<ChaCha20Poly1305>() <= 256,
+    "Review zeroize_flat_type safety",
+);
+
 pub struct CipherState {
     cipher: ChaCha20Poly1305,
     key: Zeroizing<[u8; KEY_LEN]>,
@@ -45,10 +55,16 @@ impl CipherState {
         let mut new_key = Zeroizing::new([0u8; KEY_LEN]);
         hk.expand(b"fenvoy-rekey", &mut *new_key)
             .expect("HKDF expand for 32 bytes cannot fail");
-        
+
         unsafe { zeroize::zeroize_flat_type(&mut self.cipher) };
 
         self.cipher = ChaCha20Poly1305::new(&Key::from(*new_key));
+        debug_assert_ne!(
+            &self.key[..],
+            &new_key[..],
+            "rekey produced identical key material KDF failure"
+        );
+
         self.key = new_key;
     }
 
@@ -70,7 +86,10 @@ impl CipherState {
             .encrypt(&nonce_ga, payload)
             .map_err(|_| FenvoyError::EncryptionFailed("AEAD encryption failed".into()))?;
 
-        self.counter += 1;
+        self.counter = self
+            .counter
+            .checked_add(1)
+            .expect("nonce counter overflow");
 
         if self.counter % REKEY_INTERVAL == 0 {
             self.rekey();
@@ -97,7 +116,10 @@ impl CipherState {
             .decrypt(&nonce_ga, payload)
             .map_err(|_| FenvoyError::DecryptionFailed)?;
 
-        self.counter += 1;
+        self.counter = self
+            .counter
+            .checked_add(1)
+            .expect("nonce counter overflow");
 
         if self.counter % REKEY_INTERVAL == 0 {
             self.rekey();
