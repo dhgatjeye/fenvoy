@@ -1,4 +1,5 @@
 # fenvoy
+> This project is under active development and not yet ready for general use. Expect breaking changes.
 
 Peer-to-peer file transfer over LAN
 
