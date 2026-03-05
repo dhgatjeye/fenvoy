@@ -38,22 +38,13 @@ impl FileLockGuard {
 #[cfg(windows)]
 fn platform_lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
     use windows_sys::Win32::System::IO::OVERLAPPED;
 
     let handle = file.as_raw_handle();
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
 
-    let ok = unsafe {
-        LockFileEx(
-            handle,
-            LOCKFILE_EXCLUSIVE_LOCK,
-            0,
-            1,
-            0,
-            &mut overlapped,
-        )
-    };
+    let ok = unsafe { LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &mut overlapped) };
 
     if ok != 0 {
         Ok(())

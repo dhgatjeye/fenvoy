@@ -1,14 +1,16 @@
 use crate::crypto::identity::Identity;
-use crate::error::Result;
+use crate::error::{FenvoyError, Result};
 use crate::protocol::handshake;
 use crate::transport::tcp;
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
 const MAX_CONCURRENT_HANDSHAKES: usize = 10;
+const MAX_PER_IP: usize = 3;
 
 pub struct ListenerConfig {
     pub bind_addr: SocketAddr,
@@ -16,10 +18,53 @@ pub struct ListenerConfig {
     pub identity: Arc<Identity>,
 }
 
+struct IpTracker {
+    counts: HashMap<IpAddr, usize>,
+}
+
+impl IpTracker {
+    fn new() -> Self {
+        Self {
+            counts: HashMap::new(),
+        }
+    }
+
+    fn admit_locked(&mut self, ip: IpAddr) -> bool {
+        let count = self.counts.entry(ip).or_insert(0);
+        if *count >= MAX_PER_IP {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    fn release(&mut self, ip: &IpAddr) {
+        if let Some(count) = self.counts.get_mut(ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.counts.remove(ip);
+            }
+        }
+    }
+}
+
+struct IpGuard {
+    tracker: Arc<Mutex<IpTracker>>,
+    ip: IpAddr,
+}
+
+impl Drop for IpGuard {
+    fn drop(&mut self) {
+        let mut t = self.tracker.lock().expect("IpTracker lock poisoned");
+        t.release(&self.ip);
+    }
+}
+
 pub struct ConnectionListener {
     listener: TcpListener,
     config: ListenerConfig,
     handshake_semaphore: Arc<Semaphore>,
+    ip_tracker: Arc<Mutex<IpTracker>>,
 }
 
 impl ConnectionListener {
@@ -29,13 +74,12 @@ impl ConnectionListener {
             listener,
             config,
             handshake_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES)),
+            ip_tracker: Arc::new(Mutex::new(IpTracker::new())),
         })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.listener
-            .local_addr()
-            .map_err(crate::error::FenvoyError::Io)
+        self.listener.local_addr().map_err(FenvoyError::Io)
     }
 
     pub async fn accept_one(
@@ -44,20 +88,32 @@ impl ConnectionListener {
         handshake::HandshakeResult<tokio::net::TcpStream>,
         SocketAddr,
     )> {
-        let (stream, addr) = self
-            .listener
-            .accept()
+        let permit = self
+            .handshake_semaphore
+            .clone()
+            .acquire_owned()
             .await
-            .map_err(crate::error::FenvoyError::Io)?;
+            .map_err(|_| FenvoyError::HandshakeFailed("semaphore closed".into()))?;
 
-        stream
-            .set_nodelay(true)
-            .map_err(crate::error::FenvoyError::Io)?;
+        let (stream, addr) = self.listener.accept().await.map_err(FenvoyError::Io)?;
 
-        let _permit =
-            self.handshake_semaphore.acquire().await.map_err(|_| {
-                crate::error::FenvoyError::HandshakeFailed("semaphore closed".into())
-            })?;
+        let ip = addr.ip();
+        let _ip_guard = {
+            let mut tracker = self.ip_tracker.lock().expect("IpTracker lock poisoned");
+            if !tracker.admit_locked(ip) {
+                drop(stream);
+                drop(permit);
+                return Err(FenvoyError::HandshakeFailed(format!(
+                    "per-IP limit exceeded for {ip}"
+                )));
+            }
+            IpGuard {
+                tracker: self.ip_tracker.clone(),
+                ip,
+            }
+        };
+
+        tcp::configure_stream(&stream)?;
 
         let result =
             handshake::respond(stream, &self.config.local_name, &self.config.identity).await?;

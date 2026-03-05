@@ -1,6 +1,6 @@
 [package]
 name = "fenvoy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Peer-to-peer file transfer over LAN"
 rust-version = "1.85.1"
@@ -28,7 +28,7 @@ windows-sys = { version = "0.61", features = ["Win32_Storage"] }
 libc = "0.2"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "fs", "sync", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "fs", "sync", "macros", "time", "signal"] }
 socket2 = { version = "0.6", features = ["all"] }
 libcrux-ml-kem = { version = "0.0.7", features = ["mlkem1024"] }
 x25519-dalek = { version = "3.0.0-pre.6", features = ["static_secrets"] }

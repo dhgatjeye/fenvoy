@@ -53,7 +53,7 @@ pub async fn listen(addr: SocketAddr) -> Result<TcpListener> {
     Ok(listener)
 }
 
-fn configure_stream(stream: &TcpStream) -> Result<()> {
+pub(crate) fn configure_stream(stream: &TcpStream) -> Result<()> {
     stream.set_nodelay(true).map_err(FenvoyError::Io)?;
 
     let socket = socket2::SockRef::from(stream);

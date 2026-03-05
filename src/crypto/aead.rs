@@ -86,10 +86,7 @@ impl CipherState {
             .encrypt(&nonce_ga, payload)
             .map_err(|_| FenvoyError::EncryptionFailed("AEAD encryption failed".into()))?;
 
-        self.counter = self
-            .counter
-            .checked_add(1)
-            .expect("nonce counter overflow");
+        self.counter = self.counter.checked_add(1).expect("nonce counter overflow");
 
         if self.counter % REKEY_INTERVAL == 0 {
             self.rekey();
@@ -116,10 +113,7 @@ impl CipherState {
             .decrypt(&nonce_ga, payload)
             .map_err(|_| FenvoyError::DecryptionFailed)?;
 
-        self.counter = self
-            .counter
-            .checked_add(1)
-            .expect("nonce counter overflow");
+        self.counter = self.counter.checked_add(1).expect("nonce counter overflow");
 
         if self.counter % REKEY_INTERVAL == 0 {
             self.rekey();
